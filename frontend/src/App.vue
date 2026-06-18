@@ -1,412 +1,895 @@
 <script setup lang="ts">
-import { ref, computed, nextTick } from 'vue'
-import { UploadFilled, DataBoard, Document, Setting, QuestionFilled, CircleCheck, MagicStick, Delete, Download } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import { computed, onMounted, ref } from 'vue'
+import {
+  CircleCheck,
+  DataBoard,
+  Delete,
+  Document,
+  Download,
+  Files,
+  Refresh,
+  UploadFilled,
+  WarningFilled,
+} from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
-interface DataItem { id: number; key: string; value: string }
-interface ParseResponse { items: DataItem[]; message?: string }
+type ViewMode = 'summary' | 'stages' | 'json'
 
-const DEMO_DATA: DataItem[] = [
-  { id: 1, key: '组织机构', value: '技术研发中心' },
-  { id: 2, key: '核心目标', value: 'Q2 产品交付率提升至 95%' },
-  { id: 3, key: '关键结果 1', value: '完成 3 个主要版本迭代' },
-  { id: 4, key: '关键结果 2', value: '缺陷率降低 40%' },
-  { id: 5, key: '关键结果 3', value: '自动化测试覆盖率达 85%' },
-  { id: 6, key: '服务器名称', value: 'Production-Node-01' },
-  { id: 7, key: 'CPU 使用率', value: '67.3%' },
-  { id: 8, key: '内存使用率', value: '82.1%' },
-  { id: 9, key: '磁盘 IOPS', value: '2,340 ops/s' },
-  { id: 10, key: '网络吞吐量', value: '1.2 Gbps' },
-  { id: 11, key: '运行时长', value: '142 天 6 小时' },
-]
+interface PumpScheduleItem {
+  sequence: number
+  phase: string
+  phase_type: string
+  rate_m3_per_min: number
+  clean_vol_m3: number
+  prop_conc_kg_per_m3: number
+  fluid_viscosity_mpa_s: number
+  cum_vol_m3: number
+  cum_slurry_vol_m3: number
+  cum_prop_t: number
+  fluid_type: string
+  proppant_type: string
+}
 
-const activeTab = ref('grid')
-const tableData = ref<DataItem[]>([])
-const editingCell = ref<{ rowId: number; field: 'key' | 'value' } | null>(null)
-const editingValue = ref('')
-const hasData = ref(false)
-const isDragging = ref(false)
-const isLoading = ref(false)
+interface StageData {
+  stage_number: number
+  top_md_m: number | null
+  bottom_md_m: number | null
+  length_m: number | null
+  cluster_count: number | null
+  classification: string
+  design_params: Record<string, number | string | boolean | null>
+  pump_schedule: PumpScheduleItem[]
+}
+
+interface ParseData {
+  run_id: string
+  file_name: string
+  well_name: string
+  total_stages: number
+  casing_inner_diameter_mm: number | null
+  default_pressure_limit_mpa: number | null
+  stages: StageData[]
+  raw_extract?: {
+    paragraph_count?: number
+    table_count?: number
+  }
+}
+
+interface ParseResponse {
+  success: boolean
+  message: string
+  run_id: string
+  output_path: string
+  data: ParseData
+}
+
+interface ResultSummary {
+  run_id: string
+  output_path: string
+  size_bytes: number
+  created_at: string
+  file_name?: string
+  well_name?: string
+  total_stages?: number
+  stage_count?: number
+  parsed_at?: string
+  warning?: string
+}
+
+interface ResultListResponse {
+  success: boolean
+  count: number
+  results: ResultSummary[]
+}
+
+interface ResultDetailResponse {
+  success: boolean
+  run_id: string
+  data: ParseData
+}
+
+const apiBase = import.meta.env.VITE_API_BASE ?? ''
+
 const selectedFile = ref<File | null>(null)
 const fileInputRef = ref<HTMLInputElement | null>(null)
+const isDragging = ref(false)
+const isUploading = ref(false)
+const isLoadingResults = ref(false)
+const activeTab = ref<ViewMode>('summary')
+const parseData = ref<ParseData | null>(null)
+const currentRunId = ref('')
+const results = ref<ResultSummary[]>([])
 
-const jsonOutput = computed(() => {
-  const obj: Record<string, string> = {}
-  for (const item of tableData.value) obj[item.key] = item.value
-  return JSON.stringify(obj, null, 2)
-})
+const hasData = computed(() => Boolean(parseData.value))
+const stages = computed(() => parseData.value?.stages ?? [])
+const jsonOutput = computed(() => JSON.stringify(parseData.value ?? {}, null, 2))
+const selectedResult = computed(() => results.value.find((item) => item.run_id === currentRunId.value))
 
-function loadDemo() {
-  tableData.value = DEMO_DATA.map(i => ({ ...i }))
-  hasData.value = true
-  activeTab.value = 'grid'
-  ElMessage({ message: 'Demo \u6570\u636E\u5DF2\u52A0\u8F7D', type: 'success', duration: 2000, offset: 60 })
+const summaryCards = computed(() => [
+  { label: '井名', value: parseData.value?.well_name || '-' },
+  { label: '压裂段数', value: parseData.value?.total_stages ?? '-' },
+  { label: '套管内径', value: formatMetric(parseData.value?.casing_inner_diameter_mm, 'mm') },
+  { label: '施工限压', value: formatMetric(parseData.value?.default_pressure_limit_mpa, 'MPa') },
+  { label: '表格数量', value: parseData.value?.raw_extract?.table_count ?? '-' },
+  { label: '段落数量', value: parseData.value?.raw_extract?.paragraph_count ?? '-' },
+])
+
+function apiUrl(path: string) {
+  return `${apiBase}${path}`
 }
 
-function triggerFileInput() { fileInputRef.value?.click() }
-function onFileSelected(e: Event) {
-  const input = e.target as HTMLInputElement
-  if (input.files?.length) selectedFile.value = input.files[0]
+function triggerFileInput() {
+  fileInputRef.value?.click()
 }
 
-function hDragOver(e: DragEvent) { e.preventDefault(); isDragging.value = true }
-function hDragLeave() { isDragging.value = false }
-function hDrop(e: DragEvent) {
-  e.preventDefault(); isDragging.value = false
-  const file = e.dataTransfer?.files?.[0]
-  if (file) selectedFile.value = file
+function onFileSelected(event: Event) {
+  const input = event.target as HTMLInputElement
+  if (input.files?.length) {
+    selectedFile.value = input.files[0]
+  }
+}
+
+function onDragOver(event: DragEvent) {
+  event.preventDefault()
+  isDragging.value = true
+}
+
+function onDragLeave() {
+  isDragging.value = false
+}
+
+function onDrop(event: DragEvent) {
+  event.preventDefault()
+  isDragging.value = false
+  const file = event.dataTransfer?.files?.[0]
+  if (file) {
+    selectedFile.value = file
+  }
+}
+
+async function readError(response: Response) {
+  try {
+    const body = await response.json()
+    return body.detail || body.message || `HTTP ${response.status}`
+  } catch {
+    return `HTTP ${response.status}`
+  }
 }
 
 async function uploadAndParse() {
-  if (!selectedFile.value) return
-  isLoading.value = true
-  hasData.value = false
-  const fd = new FormData()
-  fd.append('file', selectedFile.value)
+  if (!selectedFile.value) {
+    ElMessage.warning('请先选择 Word 文件')
+    return
+  }
+
+  isUploading.value = true
+  const formData = new FormData()
+  formData.append('file', selectedFile.value)
+
   try {
-    const res = await fetch('/api/parse-docx', { method: 'POST', body: fd })
-    if (!res.ok) throw new Error('HTTP ' + res.status)
-    const json: ParseResponse = await res.json()
-    if (json.items?.length) {
-      tableData.value = json.items; hasData.value = true; activeTab.value = 'grid'
-      ElMessage({ message: '\u89E3\u6790\u5B8C\u6210\uFF0C\u5171 ' + json.items.length + ' \u6761\u8BB0\u5F55', type: 'success', duration: 2000, offset: 60 })
-    } else {
-      ElMessage({ message: json.message || '\u6587\u6863\u4E2D\u672A\u8BC6\u522B\u5230\u6570\u636E', type: 'warning', duration: 3000, offset: 60 })
+    const response = await fetch(apiUrl('/api/parse-docx'), {
+      method: 'POST',
+      body: formData,
+    })
+    if (!response.ok) {
+      throw new Error(await readError(response))
     }
-  } catch (err) {
-    ElMessage({ message: '\u6587\u6863\u89E3\u6790\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5\u540E\u7AEF\u670D\u52A1', type: 'error', duration: 3000, offset: 60 })
-  } finally { isLoading.value = false }
+    const payload = (await response.json()) as ParseResponse
+    parseData.value = payload.data
+    currentRunId.value = payload.run_id
+    activeTab.value = 'summary'
+    await refreshResults(false)
+    ElMessage.success(payload.message || '解析完成')
+  } catch (error) {
+    ElMessage.error(`解析失败：${error instanceof Error ? error.message : '未知错误'}`)
+  } finally {
+    isUploading.value = false
+  }
 }
 
-function startEdit(id: number, fld: 'key' | 'value', cur: string) {
-  editingCell.value = { rowId: id, field: fld }; editingValue.value = cur
-  nextTick(() => { const inp = document.querySelector('.inline-edit-input input') as HTMLInputElement; inp?.focus(); inp?.select() })
+async function refreshResults(showMessage = true) {
+  isLoadingResults.value = true
+  try {
+    const response = await fetch(apiUrl('/api/parse-results'))
+    if (!response.ok) {
+      throw new Error(await readError(response))
+    }
+    const payload = (await response.json()) as ResultListResponse
+    results.value = payload.results
+    if (showMessage) ElMessage.success('历史结果已刷新')
+  } catch (error) {
+    ElMessage.error(`结果列表获取失败：${error instanceof Error ? error.message : '未知错误'}`)
+  } finally {
+    isLoadingResults.value = false
+  }
 }
-function confirmEdit() {
-  if (!editingCell.value) return
-  const it = tableData.value.find(d => d.id === editingCell.value!.rowId)
-  if (it && editingValue.value.trim()) it[editingCell.value.field] = editingValue.value.trim()
-  editingCell.value = null; editingValue.value = ''
+
+async function loadResult(runId: string) {
+  try {
+    const response = await fetch(apiUrl(`/api/parse-results/${encodeURIComponent(runId)}`))
+    if (!response.ok) {
+      throw new Error(await readError(response))
+    }
+    const payload = (await response.json()) as ResultDetailResponse
+    parseData.value = payload.data
+    currentRunId.value = payload.run_id
+    activeTab.value = 'summary'
+  } catch (error) {
+    ElMessage.error(`结果读取失败：${error instanceof Error ? error.message : '未知错误'}`)
+  }
 }
-function cancelEdit() { editingCell.value = null; editingValue.value = '' }
-function handleCellClick(row: DataItem) { startEdit(row.id, 'value', row.value) }
-function handleKeyDblClick(row: DataItem) { startEdit(row.id, 'key', row.key) }
-function clearData() { tableData.value = []; hasData.value = false; editingCell.value = null }
-function downloadJson() {
-  const b = new Blob([jsonOutput.value], { type: 'application/json' })
-  const u = URL.createObjectURL(b); const a = document.createElement('a')
-  a.href = u; a.download = 'data.json'; a.click(); URL.revokeObjectURL(u)
+
+function downloadResult(runId = currentRunId.value) {
+  if (!runId) return
+  const link = document.createElement('a')
+  link.href = apiUrl(`/api/parse-results/${encodeURIComponent(runId)}/download`)
+  link.download = `${runId}.json`
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
 }
-const tabThemeClass = computed(() => 'tab-theme--' + activeTab.value)
+
+async function removeResult(runId: string) {
+  try {
+    await ElMessageBox.confirm('删除后将移除 JSON 结果，并默认删除对应上传文件。', '确认删除', {
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+      type: 'warning',
+    })
+    const response = await fetch(apiUrl(`/api/parse-results/${encodeURIComponent(runId)}`), {
+      method: 'DELETE',
+    })
+    if (!response.ok) {
+      throw new Error(await readError(response))
+    }
+    if (currentRunId.value === runId) {
+      parseData.value = null
+      currentRunId.value = ''
+    }
+    await refreshResults(false)
+    ElMessage.success('删除完成')
+  } catch (error) {
+    if (error !== 'cancel') {
+      ElMessage.error(`删除失败：${error instanceof Error ? error.message : '未知错误'}`)
+    }
+  }
+}
+
+function formatMetric(value: number | null | undefined, unit: string) {
+  if (value === null || value === undefined) return '-'
+  return `${value}${unit}`
+}
+
+function formatNumber(value: number | string | boolean | null | undefined, unit = '') {
+  if (value === null || value === undefined || value === '') return '-'
+  return `${value}${unit}`
+}
+
+function formatSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(2)} MB`
+}
+
+function shortRunId(runId: string) {
+  return runId.length > 30 ? `${runId.slice(0, 24)}...` : runId
+}
+
+function stageParam(stage: StageData, key: string) {
+  return stage.design_params?.[key]
+}
+
+onMounted(() => {
+  refreshResults(false)
+})
 </script>
 
 <template>
-  <div class="app-root" :class="tabThemeClass">
+  <div class="app-root">
     <aside class="left-panel">
-      <div class="panel-header">
-        <div class="brand">
-          <DataBoard class="brand-icon" />
-          <div class="brand-text">
-            <span class="brand-title">数据解析工作台</span>
-            <span class="brand-sub">Data Parser Studio</span>
-          </div>
+      <div class="brand">
+        <DataBoard class="brand-icon" />
+        <div>
+          <h1>压裂设计解析</h1>
+          <p>Word 读取 · 智能分析 · JSON 存储</p>
         </div>
-     </div>
-
-      <input ref="fileInputRef" type="file" accept=".doc,.docx" style="display:none" @change="onFileSelected" />
-      <div ref="uploadRef" class="upload-zone" :class="{ 'is-dragover': isDragging }"
-        @dragover="hDragOver" @dragleave="hDragLeave" @drop="hDrop">
-        <div class="upload-placeholder" @click="triggerFileInput">
-            <template v-if="!selectedFile">
-              <UploadFilled class="upload-icon" />
-              <p class="upload-text">点击选择 Word 文档</p>
-              <p class="upload-hint">支持 .doc / .docx 格式</p>
-            </template>
-            <template v-else>
-              <Document class="upload-icon" />
-              <p class="upload-text">{{ selectedFile.name }}</p>
-              <p class="upload-hint">{{ (selectedFile.size / 1024).toFixed(1) }} KB</p>
-            </template>
-        </div>
-        <button v-if="selectedFile && !isLoading" class="parse-btn" @click="uploadAndParse">
-          <MagicStick class="btn-icon" />
-          <span>解析文档</span>
-        </button>
-       <div class="loading-spinner" v-if="isLoading"></div>
-      </div>
-      <div class="demo-section">
-        <button class="demo-btn" @click="loadDemo">
-          <MagicStick class="btn-icon" />
-          <span class="btn-label">一键加载 Demo</span>
-        </button>
-        <p class="demo-hint">免文件启动 · 含部门 OKR 与服务器指标数据</p>
       </div>
 
-      <div class="settings-section" v-if="hasData">
-        <div class="section-title">
-          <Setting class="section-icon" />
-          <span>服务配置</span>
+      <input
+        ref="fileInputRef"
+        class="hidden-input"
+        type="file"
+        accept=".doc,.docx"
+        @change="onFileSelected"
+      />
+
+      <section class="upload-zone" :class="{ dragging: isDragging }" @dragover="onDragOver" @dragleave="onDragLeave" @drop="onDrop">
+        <button class="upload-select" type="button" @click="triggerFileInput">
+          <UploadFilled class="upload-icon" />
+          <span>{{ selectedFile ? selectedFile.name : '选择 Word 文档' }}</span>
+          <small>{{ selectedFile ? formatSize(selectedFile.size) : '支持 .doc / .docx，或拖拽到这里' }}</small>
+        </button>
+        <el-button class="parse-button" type="primary" :loading="isUploading" :disabled="!selectedFile" @click="uploadAndParse">
+          开始解析
+        </el-button>
+      </section>
+
+      <section class="history-panel">
+        <div class="panel-title">
+          <span>历史结果</span>
+          <el-button size="small" :icon="Refresh" text :loading="isLoadingResults" @click="refreshResults()" />
         </div>
-        <div class="settings-body">
-          <div class="setting-row">
-            <label class="setting-label">视图模式</label>
-            <el-radio-group v-model="activeTab" size="small">
-              <el-radio-button value="grid">表格</el-radio-button>
-              <el-radio-button value="json">JSON</el-radio-button>
-            </el-radio-group>
-          </div>
-          <div class="setting-row">
-            <label class="setting-label">数据操作</label>
-            <div class="action-row">
-              <el-button size="small" :icon="Download" @click="downloadJson">导出 JSON</el-button>
-              <el-button size="small" :icon="Delete" type="danger" plain @click="clearData">清除</el-button>
+
+        <div v-if="results.length" class="result-list">
+          <article
+            v-for="item in results"
+            :key="item.run_id"
+            class="result-item"
+            :class="{ active: item.run_id === currentRunId }"
+          >
+            <button class="result-main" type="button" @click="loadResult(item.run_id)">
+              <strong>{{ item.well_name || item.file_name || '未命名结果' }}</strong>
+              <span>{{ shortRunId(item.run_id) }}</span>
+              <small>{{ item.stage_count ?? 0 }} 段 · {{ formatSize(item.size_bytes) }}</small>
+            </button>
+            <div class="result-actions">
+              <el-button size="small" :icon="Download" text @click="downloadResult(item.run_id)" />
+              <el-button size="small" :icon="Delete" text type="danger" @click="removeResult(item.run_id)" />
             </div>
-          </div>
+          </article>
         </div>
-      </div>
-
-      <div class="help-section">
-        <div class="section-title">
-          <QuestionFilled class="section-icon" />
-          <span>快速指引</span>
+        <div v-else class="empty-history">
+          <Files class="empty-icon" />
+          <span>暂无历史 JSON</span>
         </div>
-        <ul class="help-list">
-          <li><CircleCheck class="check-icon" /> 单击单元格编辑值</li>
-          <li><CircleCheck class="check-icon" /> 双击键名编辑字段名</li>
-          <li><CircleCheck class="check-icon" /> JSON 同步实时更新</li>
-        </ul>
-      </div>
-
-      <div class="panel-footer"><span>v1.1.0</span></div>
+      </section>
     </aside>
 
-    <main class="right-panel">
-      <div class="right-header">
-        <h2 class="right-title">
-          <template v-if="activeTab === 'grid'">表格可视化</template>
-          <template v-else>JSON 数据结构</template>
-        </h2>
-        <span class="right-meta" v-if="hasData">{{ tableData.length }} 条记录</span>
-        <span class="right-meta muted" v-else>等待数据加载...</span>
-      </div>
+    <main class="workspace">
+      <header class="workspace-header">
+        <div>
+          <h2>{{ parseData?.well_name || '等待解析文件' }}</h2>
+          <p v-if="parseData">{{ parseData.file_name }} · {{ currentRunId }}</p>
+          <p v-else>上传 Word 后，解析结果会显示在这里。</p>
+        </div>
+        <div class="header-actions" v-if="hasData">
+          <el-button :icon="Download" @click="downloadResult()">下载 JSON</el-button>
+          <el-button :icon="Delete" type="danger" plain @click="removeResult(currentRunId)">删除结果</el-button>
+        </div>
+      </header>
 
-      <div class="tab-bar">
-        <button class="tab-btn" :class="{ active: activeTab === 'grid' }" @click="activeTab = 'grid'">
-          <DataBoard class="tab-btn-icon" />
-          <span>Grid</span>
+      <nav class="view-tabs">
+        <button :class="{ active: activeTab === 'summary' }" type="button" @click="activeTab = 'summary'">
+          <CircleCheck />
+          摘要
         </button>
-        <button class="tab-btn" :class="{ active: activeTab === 'json' }" @click="activeTab = 'json'">
-          <Document class="tab-btn-icon" />
-          <span>JSON</span>
+        <button :class="{ active: activeTab === 'stages' }" type="button" @click="activeTab = 'stages'">
+          <DataBoard />
+          分段
         </button>
-      </div>
+        <button :class="{ active: activeTab === 'json' }" type="button" @click="activeTab = 'json'">
+          <Document />
+          JSON
+        </button>
+      </nav>
 
-     <div class="tab-content">
-        <div class="grid-view" v-show="activeTab === 'grid'">
-           <div class="table-wrap" v-if="hasData">
-             <el-table :data="tableData" stripe highlight-current-row size="small" style="width: 100%" :cell-style="{ cursor: 'pointer' }">
-               <el-table-column type="index" label="#" width="48" fixed />
-                <el-table-column prop="key" label="键名 (Key)" min-width="180">
-                  <template #default="{ row }">
-                    <div class="cell-content">
-                      <template v-if="editingCell?.rowId === row.id && editingCell?.field === 'key'">
-                        <el-input v-model="editingValue" size="small" class="inline-edit-input"
-                          @blur="confirmEdit" @keyup.enter="confirmEdit" @keyup.escape="cancelEdit" />
-                      </template>
-                      <span v-else class="cell-key" @dblclick.stop="handleKeyDblClick(row)" title="双击编辑键名">{{ row.key }}</span>
-                    </div>
-                  </template>
-                </el-table-column>
-                <el-table-column prop="value" label="值 (Value)" min-width="240">
-                  <template #default="{ row }">
-                    <div class="cell-content">
-                      <template v-if="editingCell?.rowId === row.id && editingCell?.field === 'value'">
-                        <el-input v-model="editingValue" size="small" class="inline-edit-input"
-                          @blur="confirmEdit" @keyup.enter="confirmEdit" @keyup.escape="cancelEdit" />
-                      </template>
-                      <span v-else class="cell-value" @click.stop="handleCellClick(row)" title="单击编辑值">{{ row.value }}</span>
-                    </div>
-                  </template>
-                </el-table-column>
-              </el-table>
+      <section class="content-area">
+        <div v-if="!hasData" class="empty-state">
+          <UploadFilled class="empty-main-icon" />
+          <h3>还没有解析结果</h3>
+          <p>先在左侧上传压裂设计 Word 文件，或从历史结果中选择一条记录。</p>
+        </div>
+
+        <template v-else>
+          <section v-show="activeTab === 'summary'" class="summary-view">
+            <div class="summary-grid">
+              <article v-for="card in summaryCards" :key="card.label" class="metric-card">
+                <span>{{ card.label }}</span>
+                <strong>{{ card.value }}</strong>
+              </article>
             </div>
-            <div class="empty-state" v-else>
-              <UploadFilled class="empty-icon" />
-              <p class="empty-text">暂无数据</p>
-              <p class="empty-hint">通过左侧上传文件或点击 Demo 加载示例数据</p>
-           </div>
-         </div>
 
-        <div class="code-view" v-show="activeTab === 'json'">
-           <div class="code-toolbar">
-             <span class="code-lang">JSON</span>
-             <el-button size="small" :icon="Download" text @click="downloadJson">下载</el-button>
-           </div>
-           <pre class="code-block" v-if="hasData"><code>{{ jsonOutput }}</code></pre>
-            <div class="empty-state" v-else>
-              <Document class="empty-icon" />
-              <p class="empty-text">暂无 JSON 数据</p>
-           </div>
-         </div>
-     </div>
+            <div class="detail-band">
+              <div>
+                <h3>当前结果</h3>
+                <p>{{ selectedResult?.output_path || '结果已返回，但暂未匹配到本地路径。' }}</p>
+              </div>
+              <el-tag v-if="selectedResult" type="success">已存储</el-tag>
+              <el-tag v-else type="warning">新结果</el-tag>
+            </div>
+
+            <el-table :data="stages.slice(0, 8)" stripe size="small" class="preview-table">
+              <el-table-column prop="stage_number" label="段号" width="80" />
+              <el-table-column prop="classification" label="分类" width="120" />
+              <el-table-column prop="length_m" label="段长(m)" width="100" />
+              <el-table-column label="最大排量" width="110">
+                <template #default="{ row }">{{ formatNumber(stageParam(row, 'max_rate_m3_per_min'), ' m³/min') }}</template>
+              </el-table-column>
+              <el-table-column label="暂堵次数" width="100">
+                <template #default="{ row }">{{ formatNumber(stageParam(row, 'temporary_plugging_times')) }}</template>
+              </el-table-column>
+              <el-table-column label="泵注阶段">
+                <template #default="{ row }">{{ row.pump_schedule?.length || 0 }} 行</template>
+              </el-table-column>
+            </el-table>
+          </section>
+
+          <section v-show="activeTab === 'stages'" class="stages-view">
+            <el-table :data="stages" stripe height="100%" size="small">
+              <el-table-column prop="stage_number" label="段号" width="70" fixed />
+              <el-table-column prop="classification" label="分类" width="120" />
+              <el-table-column prop="top_md_m" label="顶深(m)" width="100" />
+              <el-table-column prop="bottom_md_m" label="底深(m)" width="100" />
+              <el-table-column prop="length_m" label="段长(m)" width="95" />
+              <el-table-column label="最大排量" width="110">
+                <template #default="{ row }">{{ formatNumber(stageParam(row, 'max_rate_m3_per_min')) }}</template>
+              </el-table-column>
+              <el-table-column label="粉砂浓度" width="150">
+                <template #default="{ row }">
+                  {{ formatNumber(stageParam(row, 'sand_stage_min_conc_kg_per_m3')) }} -
+                  {{ formatNumber(stageParam(row, 'sand_stage_max_conc_kg_per_m3')) }}
+                </template>
+              </el-table-column>
+              <el-table-column label="陶粒浓度" width="150">
+                <template #default="{ row }">
+                  {{ formatNumber(stageParam(row, 'ceramic_stage_min_conc_kg_per_m3')) }} -
+                  {{ formatNumber(stageParam(row, 'ceramic_stage_max_conc_kg_per_m3')) }}
+                </template>
+              </el-table-column>
+              <el-table-column label="暂堵次数" width="100">
+                <template #default="{ row }">{{ formatNumber(stageParam(row, 'temporary_plugging_times')) }}</template>
+              </el-table-column>
+              <el-table-column label="泵注程序" min-width="120">
+                <template #default="{ row }">{{ row.pump_schedule?.length || 0 }} 行</template>
+              </el-table-column>
+            </el-table>
+          </section>
+
+          <section v-show="activeTab === 'json'" class="json-view">
+            <div class="json-toolbar">
+              <span>解析 JSON 数据体</span>
+              <el-button size="small" :icon="Download" @click="downloadResult()">下载</el-button>
+            </div>
+            <pre><code>{{ jsonOutput }}</code></pre>
+          </section>
+        </template>
+      </section>
     </main>
+
+    <div class="service-tip">
+      <WarningFilled />
+      <span>请确保后端已启动：uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload</span>
+    </div>
   </div>
 </template>
 
 <style scoped>
 .app-root {
-  --color-grid: #58a6ff;
-  --color-json: #3fb950;
-  --color-grid-soft: rgba(88, 166, 255, 0.12);
-  --color-json-soft: rgba(63, 185, 80, 0.12);
-  --left-bg: #161b22;
-  --left-border: #30363d;
-  --text-primary: #e6edf3;
-  --text-secondary: #8b949e;
-  --text-muted: #6e7681;
-  --radius-sm: 8px;
-  --radius-md: 12px;
-  --radius-lg: 16px;
-  --transition-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
-  display: flex;
+  display: grid;
+  grid-template-columns: 340px 1fr;
   height: 100vh;
   width: 100vw;
-  overflow: hidden;
   background: #0d1117;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  color: var(--text-primary);
+  color: #e6edf3;
+  overflow: hidden;
 }
 
 .left-panel {
-  width: 320px;
-  min-width: 320px;
-  background: var(--left-bg);
-  border-right: 1px solid var(--left-border);
   display: flex;
   flex-direction: column;
-  padding: 24px 20px;
-  box-sizing: border-box;
-  overflow-y: auto;
   gap: 18px;
+  min-width: 0;
+  padding: 22px;
+  background: #151b23;
+  border-right: 1px solid #30363d;
+  overflow: hidden;
 }
 
-.panel-header { padding-bottom: 14px; border-bottom: 1px solid var(--left-border) }
-.brand { display: flex; align-items: center; gap: 10px }
-.brand-icon { width: 28px; height: 28px; color: var(--color-grid); transition: color 0.4s var(--transition-spring) }
-.tab-theme--json .brand-icon { color: var(--color-json) }
-.brand-text { display: flex; flex-direction: column }
-.brand-title { font-size: 16px; font-weight: 600; line-height: 1.3 }
-.brand-sub { font-size: 11px; color: var(--text-muted); letter-spacing: 0.3px }
+.brand {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding-bottom: 16px;
+  border-bottom: 1px solid #30363d;
+}
+
+.brand-icon {
+  width: 32px;
+  height: 32px;
+  color: #58a6ff;
+}
+
+.brand h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.brand p {
+  margin: 3px 0 0;
+  color: #8b949e;
+  font-size: 12px;
+}
+
+.hidden-input {
+  display: none;
+}
 
 .upload-zone {
-  border: 2px dashed #484f5a;
-  border-radius: var(--radius-md);
-  padding: 18px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  border: 1px dashed #484f58;
+  border-radius: 8px;
+  background: #0d1117;
+}
+
+.upload-zone.dragging {
+  border-color: #58a6ff;
+  background: rgba(88, 166, 255, 0.1);
+}
+
+.upload-select {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  min-height: 112px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.upload-select span {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.upload-select small {
+  color: #8b949e;
+}
+
+.upload-icon {
+  width: 34px;
+  height: 34px;
+  color: #58a6ff;
+}
+
+.parse-button {
+  width: 100%;
+}
+
+.history-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+
+.panel-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  color: #c9d1d9;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.result-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.result-item {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: center;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  padding: 10px;
+  background: #0d1117;
+}
+
+.result-item.active {
+  border-color: #58a6ff;
+  background: rgba(88, 166, 255, 0.1);
+}
+
+.result-main {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  border: 0;
+  padding: 0;
+  text-align: left;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.result-main strong,
+.result-main span,
+.result-main small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.result-main strong {
+  font-size: 13px;
+}
+
+.result-main span,
+.result-main small {
+  color: #8b949e;
+  font-size: 11px;
+}
+
+.result-actions {
+  display: flex;
+  align-items: center;
+}
+
+.empty-history {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 120px;
+  color: #8b949e;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+}
+
+.empty-icon {
+  width: 20px;
+  height: 20px;
+}
+
+.workspace {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.workspace-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  align-items: center;
+  padding: 24px 30px 16px;
+  border-bottom: 1px solid #21262d;
+}
+
+.workspace-header h2 {
+  margin: 0;
+  font-size: 22px;
+}
+
+.workspace-header p {
+  margin: 6px 0 0;
+  color: #8b949e;
+  font-size: 13px;
+}
+
+.header-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.view-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 14px 30px 0;
+}
+
+.view-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 34px;
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: 8px 8px 0 0;
+  background: transparent;
+  color: #8b949e;
+  cursor: pointer;
+}
+
+.view-tabs svg {
+  width: 16px;
+  height: 16px;
+}
+
+.view-tabs button.active {
+  color: #58a6ff;
+  border-color: #30363d;
+  border-bottom-color: #0d1117;
+  background: #0d1117;
+}
+
+.content-area {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  padding: 18px 30px 58px;
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 420px;
+  color: #8b949e;
   text-align: center;
-  transition: all 0.35s var(--transition-spring);
-  background: rgba(255,255,255,0.03);
 }
-.upload-zone.is-dragover { border-color: var(--color-grid); background: var(--color-grid-soft); transform: scale(1.02) }
-.tab-theme--json .upload-zone.is-dragover { border-color: var(--color-json); background: var(--color-json-soft) }
-.upload-inner { width: 100% }
-.upload-placeholder { display: flex; flex-direction: column; align-items: center; gap: 6px; cursor: pointer }
-.upload-icon { width: 32px; height: 32px; color: #484f5a; transition: color 0.3s, transform 0.35s var(--transition-spring) }
-.upload-zone:hover .upload-icon { color: var(--color-grid); transform: translateY(-2px) }
-.tab-theme--json .upload-zone:hover .upload-icon { color: var(--color-json) }
-.spinning { animation: spin 1s linear infinite }
-@keyframes spin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } }
-.upload-text { font-size: 14px; font-weight: 500; margin: 0; color: var(--text-primary) }
-.upload-hint { font-size: 11px; margin: 0; color: var(--text-muted) }
-.loading-spinner { width: 32px; height: 32px; border: 3px solid #484f5a; border-top-color: var(--color-grid); border-radius: 50%; animation: spin 0.8s linear infinite }
-.upload-zone .parse-btn { margin-top: 12px; width: 100%; padding: 10px 16px; border: none; border-radius: var(--radius-sm); background: var(--color-grid); color: #fff; font-size: 14px; font-weight: 500; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; transition: all 0.25s var(--transition-spring) }
-.upload-zone .parse-btn:hover { filter: brightness(1.1); transform: translateY(-1px) }
-.upload-zone .parse-btn:active { transform: translateY(0) }
-.tab-theme--json .upload-zone .parse-btn { background: var(--color-json) }
-.tab-theme--json .loading-spinner { border-top-color: var(--color-json) }
 
-.demo-section { display: flex; flex-direction: column; gap: 8px }
-.demo-btn {
-  display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%;
-  padding: 12px 16px; border: none; border-radius: var(--radius-sm);
-  background: linear-gradient(135deg, #58a6ff, #1d7cf2); color: #fff;
-  font-size: 14px; font-weight: 500; cursor: pointer;
-  transition: all 0.3s var(--transition-spring);
-  box-shadow: 0 2px 8px rgba(88, 166, 255, 0.25);
+.empty-state h3 {
+  margin: 12px 0 6px;
+  color: #e6edf3;
 }
-.demo-btn:hover { transform: translateY(-1px) scale(1.01); box-shadow: 0 4px 16px rgba(88, 166, 255, 0.35) }
-.demo-btn:active { transform: translateY(0) scale(0.98) }
-.tab-theme--json .demo-btn { background: linear-gradient(135deg, #3fb950, #2d8a3e); box-shadow: 0 2px 8px rgba(63, 185, 80, 0.25) }
-.tab-theme--json .demo-btn:hover { box-shadow: 0 4px 16px rgba(63, 185, 80, 0.35) }
-.btn-icon { width: 18px; height: 18px }
-.demo-hint { font-size: 11px; color: var(--text-muted); margin: 0; text-align: center }
 
-.settings-section { background: rgba(255,255,255,0.04); border-radius: var(--radius-md); padding: 14px 16px; border: 1px solid var(--left-border); animation: slideDown 0.35s var(--transition-spring) }
-.section-title { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; color: var(--text-secondary); margin-bottom: 12px }
-.section-icon { width: 16px; height: 16px }
-.settings-body { display: flex; flex-direction: column; gap: 12px }
-.setting-row { display: flex; flex-direction: column; gap: 6px }
-.setting-label { font-size: 12px; color: var(--text-muted) }
-.action-row { display: flex; gap: 8px; flex-wrap: wrap }
-
-.help-section { margin-top: auto }
-.help-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px }
-.help-list li { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-secondary) }
-.check-icon { width: 14px; height: 14px; color: var(--color-grid); flex-shrink: 0 }
-.tab-theme--json .check-icon { color: var(--color-json) }
-.panel-footer { padding-top: 12px; border-top: 1px solid var(--left-border); font-size: 11px; color: var(--text-muted); text-align: center }
-
-.right-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: #0d1117 }
-.right-header { display: flex; align-items: baseline; gap: 12px; padding: 20px 28px 0 }
-.right-title { font-size: 18px; font-weight: 600; margin: 0; transition: color 0.3s }
-.tab-theme--grid .right-title { color: var(--color-grid) }
-.tab-theme--json .right-title { color: var(--color-json) }
-.right-meta { font-size: 12px; padding: 2px 10px; border-radius: 20px; background: var(--color-grid-soft); color: var(--color-grid); font-weight: 500; transition: all 0.3s }
-.right-meta.muted { background: #21262d; color: var(--text-muted) }
-.tab-theme--json .right-meta:not(.muted) { background: var(--color-json-soft); color: var(--color-json) }
-
-.tab-bar { display: flex; gap: 4px; padding: 16px 28px 0; border-bottom: 1px solid #21262d }
-.tab-btn {
-  display: flex; align-items: center; gap: 6px; padding: 8px 20px; border: none;
-  background: transparent; color: var(--text-muted); font-size: 13px; font-weight: 500;
-  cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px;
-  transition: all 0.25s var(--transition-spring); border-radius: 6px 6px 0 0;
+.empty-main-icon {
+  width: 48px;
+  height: 48px;
+  color: #58a6ff;
 }
-.tab-btn:hover { color: var(--text-primary); background: #1c2333 }
-.tab-btn.active { color: var(--color-grid); border-bottom-color: var(--color-grid); background: var(--color-grid-soft) }
-.tab-theme--json .tab-btn.active { color: var(--color-json); border-bottom-color: var(--color-json); background: var(--color-json-soft) }
-.tab-btn-icon { width: 16px; height: 16px }
 
-.tab-content { flex: 1; overflow: auto; padding: 16px 28px 28px }
-.grid-view { height: 100% }
-.table-wrap { border: 1px solid #21262d; border-radius: var(--radius-md); overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,0.3) }
-.cell-content { min-height: 28px; display: flex; align-items: center }
-.cell-key { cursor: default; font-weight: 500; color: var(--text-primary); padding: 2px 4px; border-radius: 4px; transition: background 0.15s }
-.cell-key:hover { background: rgba(63,185,80,0.10) }
-.cell-value { cursor: pointer; padding: 2px 4px; border-radius: 4px; transition: all 0.2s; border: 1px solid transparent }
-.cell-value:hover { background: #1c2333; border-color: #30363d }
-.inline-edit-input { width: 100% }
-
-.code-view { display: flex; flex-direction: column; height: 100% }
-.code-toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px }
-.code-lang { font-size: 12px; font-weight: 600; padding: 2px 10px; border-radius: 20px; background: var(--color-json-soft); color: var(--color-json) }
-.code-block {
-  flex: 1; margin: 0; padding: 18px 20px; background: #1a1b26; color: #c9d1d9;
-  border-radius: var(--radius-md); font-family: "JetBrains Mono", "Fira Code", Consolas, monospace;
-  font-size: 13px; line-height: 1.6; overflow: auto; white-space: pre; tab-size: 2; border: 1px solid #2e303a;
+.summary-view {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
 }
-.code-block code { font-family: inherit; background: transparent; color: inherit; padding: 0 }
 
-.empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 260px; gap: 10px; color: var(--text-muted) }
-.empty-icon { width: 40px; height: 40px; opacity: 0.5 }
-.empty-text { font-size: 15px; font-weight: 500; margin: 0 }
-.empty-hint { font-size: 12px; margin: 0; color: var(--text-muted) }
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(160px, 1fr));
+  gap: 12px;
+}
 
-@keyframes slideDown { from { opacity: 0; transform: translateY(-8px) } to { opacity: 1; transform: translateY(0) } }
+.metric-card {
+  min-height: 92px;
+  padding: 16px;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  background: #151b23;
+}
 
-:deep(.el-table__header th.el-table__cell) { background: #1c2333; color: var(--text-secondary); font-weight: 600; font-size: 12px }
-:deep(.el-table--small .el-table__cell) { padding: 6px 8px }
-:deep(.el-table--striped .el-table__body tr.el-table__row--striped td.el-table__cell) { background: #161b22 }
-.upload-placeholder { cursor: pointer }
-:deep(.el-radio-group--small .el-radio-button__inner) { font-size: 12px; padding: 4px 12px }
-:deep(.el-button--small) { font-size: 12px }
+.metric-card span {
+  color: #8b949e;
+  font-size: 12px;
+}
+
+.metric-card strong {
+  display: block;
+  margin-top: 10px;
+  font-size: 24px;
+  color: #f0f6fc;
+}
+
+.detail-band {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+  padding: 16px;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  background: #10161f;
+}
+
+.detail-band h3 {
+  margin: 0 0 6px;
+  font-size: 15px;
+}
+
+.detail-band p {
+  margin: 0;
+  color: #8b949e;
+  word-break: break-all;
+}
+
+.preview-table,
+.stages-view {
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.stages-view {
+  height: 100%;
+  min-height: 520px;
+}
+
+.json-view {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.json-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: #c9d1d9;
+}
+
+.json-view pre {
+  margin: 0;
+  padding: 18px;
+  min-height: 560px;
+  overflow: auto;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  background: #0b1017;
+  color: #c9d1d9;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.service-tip {
+  position: fixed;
+  right: 18px;
+  bottom: 14px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  max-width: min(720px, calc(100vw - 36px));
+  padding: 8px 12px;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  background: rgba(13, 17, 23, 0.92);
+  color: #8b949e;
+  font-size: 12px;
+}
+
+.service-tip svg {
+  width: 16px;
+  height: 16px;
+  color: #d29922;
+  flex-shrink: 0;
+}
+
+:deep(.el-table) {
+  --el-table-bg-color: #151b23;
+  --el-table-tr-bg-color: #151b23;
+  --el-table-header-bg-color: #10161f;
+  --el-table-header-text-color: #c9d1d9;
+  --el-table-text-color: #e6edf3;
+  --el-table-border-color: #30363d;
+  --el-table-row-hover-bg-color: #1f2937;
+}
+
+@media (max-width: 980px) {
+  .app-root {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr;
+  }
+
+  .left-panel {
+    max-height: 44vh;
+    border-right: 0;
+    border-bottom: 1px solid #30363d;
+  }
+
+  .summary-grid {
+    grid-template-columns: repeat(2, minmax(140px, 1fr));
+  }
+}
 </style>
