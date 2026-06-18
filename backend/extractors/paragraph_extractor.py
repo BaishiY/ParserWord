@@ -1,41 +1,47 @@
-import logging
+from __future__ import annotations
+
 import re
-from backend.schemas.models import DataItem
+from typing import Any, Dict, List
 
-logger = logging.getLogger(__name__)
+from backend.extractors.table_extractor import clean_text, parse_number
 
-KV_PATTERN = re.compile(r'^(.+?)[：:]\s*(.+)$')
 
-SKIP_PATTERNS = [
-    re.compile(r'^第[一二三四五六七八九十\d]+[章节篇部]'),
-]
+KEY_VALUE_RE = re.compile(
+    r"(?P<key>[\u4e00-\u9fffA-Za-z0-9_（）()/%·.\-]{2,30})\s*[:：]\s*(?P<value>[^；;，,\n]{1,80})"
+)
 
-def extract_from_paragraphs(paragraphs: list[str]) -> list[DataItem]:
-    items: list[DataItem] = []
-    seen_keys: set[str] = set()
-    _id = [0]
 
-    def add_item(key: str, value: str):
-        k = key.strip().rstrip('\uff1a:\t ')
-        v = value.strip()
-        if k and v:
-            dedup_key = k
-            suffix = 1
-            while dedup_key in seen_keys:
-                suffix += 1
-                dedup_key = f'{k}_{suffix}'
-            seen_keys.add(dedup_key)
-            _id[0] += 1
-            items.append(DataItem(id=_id[0], key=dedup_key, value=v))
-
-    for para in paragraphs:
-        if any(p.match(para) for p in SKIP_PATTERNS):
+def extract_key_values(paragraphs: List[str]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for idx, paragraph in enumerate(paragraphs):
+        text = clean_text(paragraph)
+        if not text:
             continue
-        match = KV_PATTERN.match(para)
-        if match:
-            key = match.group(1).strip()
-            value = match.group(2).strip()
-            if len(key) <= 40:
-                add_item(key, value)
-
+        for match in KEY_VALUE_RE.finditer(text):
+            key = match.group("key").strip()
+            value = match.group("value").strip()
+            parsed = parse_number(value)
+            item: Dict[str, Any] = {
+                "paragraph_index": idx,
+                "key": key,
+                "value": value,
+                "source_text": text,
+            }
+            if parsed.numbers:
+                item["number"] = parsed.value
+                item["numbers"] = parsed.numbers
+                item["min"] = parsed.min
+                item["max"] = parsed.max
+                item["unit"] = parsed.unit
+            items.append(item)
     return items
+
+
+def surrounding_text(paragraphs: List[str], keyword: str, window: int = 2) -> List[str]:
+    hits: List[str] = []
+    for idx, paragraph in enumerate(paragraphs):
+        if keyword in paragraph:
+            start = max(0, idx - window)
+            end = min(len(paragraphs), idx + window + 1)
+            hits.append("\n".join(paragraphs[start:end]))
+    return hits

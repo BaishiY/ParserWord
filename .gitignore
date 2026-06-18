@@ -1,27 +1,15 @@
-# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
-*.pyd
-*.egg-info/
-dist/
-build/
-.eggs/
-
-# IDE
-.vscode/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
 .idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Test scripts
-test_parser.py
-run_tests.py
-debug_doc.py
-
-# Git index temp
-git_index_tmp*
+.vscode/
+*.log
+backend/storage/uploads/
+backend/storage/parsed_json/
+*.tables.json

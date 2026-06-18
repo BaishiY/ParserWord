@@ -1,51 +1,51 @@
-"""Layer 1: .docx 核心解析器"""
-import io
-from typing import Optional
+from __future__ import annotations
 
-from docx import Document as DocxDocument
-from docx.table import Table as DocxTable
+from pathlib import Path
+from typing import Any, Iterable, List
 
-from backend.parsers.base import DocParser
-from backend.schemas.models import RawDocument
+from docx import Document
+from docx.table import Table
+from docx.text.paragraph import Paragraph
+
+from backend.extractors.table_extractor import analyze_table, clean_text, table_to_matrix, update_context
+from backend.parsers.base import DocParser, ParsedDocument
+
+
+def iter_block_items(doc: Any) -> Iterable[Any]:
+    body = doc.element.body
+    for child in body.iterchildren():
+        if child.tag.endswith("}p"):
+            yield Paragraph(child, doc)
+        elif child.tag.endswith("}tbl"):
+            yield Table(child, doc)
 
 
 class DocxParser(DocParser):
-    """
-    .docx 解析器 — 主干道，覆盖 90%+ 现代文档
-
-    原理：python-docx 直接解压二进制流，读取 word/document.xml，
-    在 XML 树中表格由 <w:tbl> 包裹，行 <w:tr>，列 <w:tc>，
-    以结构化方式还原全部内容，不会粘连。
-    """
-
-    def parse(self, file_path: str) -> RawDocument:
-        doc = DocxDocument(file_path)
-        return self._extract(doc, filename=file_path)
-
-    def parse_bytes(self, content: bytes, filename: str = "") -> RawDocument:
-        doc = DocxDocument(io.BytesIO(content))
-        return self._extract(doc, filename=filename)
-
-    def _extract(self, doc: DocxDocument, filename: str = "") -> RawDocument:
-        paragraphs = []
-        for p in doc.paragraphs:
-            text = self._clean_text(p.text)
-            if text:
-                paragraphs.append(text)
-
+    def parse(self) -> ParsedDocument:
+        doc = Document(str(self.file_path))
+        paragraphs: List[str] = []
         tables = []
-        for table in doc.tables:
-            table_data = []
-            for row in table.rows:
-                row_data = [self._clean_text(cell.text) for cell in row.cells]
-                # 跳过全空行
-                if any(cell for cell in row_data):
-                    table_data.append(row_data)
-            if table_data:
-                tables.append(table_data)
+        context: List[str] = []
+        table_index = 0
 
-        return RawDocument(
+        for block in iter_block_items(doc):
+            if isinstance(block, Paragraph):
+                text = clean_text(block.text)
+                if text:
+                    paragraphs.append(text)
+                update_context(context, text)
+                continue
+
+            if isinstance(block, Table):
+                table_index += 1
+                matrix = table_to_matrix(block)
+                extracted = analyze_table(table_index, matrix, list(context))
+                tables.append(extracted.to_dict(include_raw=True))
+
+        return ParsedDocument(
+            source_path=self.file_path,
+            original_path=self.file_path,
             paragraphs=paragraphs,
             tables=tables,
-            filename=filename
+            conversion={"converted": False},
         )

@@ -1,1 +1,1 @@
-
+"""Word document parser implementations."""
